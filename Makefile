@@ -1,9 +1,5 @@
 # language: Makefile, file: Makefile, target: Linux x86-64
 # xnv — Nerva CNA v11 miner
-#
-#   make              # build
-#   make clean
-
 CC      = gcc
 CFLAGS  = -O3 -maes -msse4.2 -march=native -pthread \
           -I. \
@@ -22,6 +18,7 @@ SRCS = \
     slow-hash-sw.c \
     slow-hash-v8-sw.c \
     cna-vm.c \
+    hc128.c \
     oaes_lib.c \
     aesb.c \
     keccak.c \
