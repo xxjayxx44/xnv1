@@ -1,0 +1,4 @@
+*.o
+xnv
+diag*.log
+build.log
