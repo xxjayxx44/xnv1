@@ -124,7 +124,25 @@ static inline void memcpy_swap64(void *dst, const void *src, size_t n) {
 #define SWAP64LE IDENT64
 #define SWAP64BE SWAP64
 #define swap16le ident16
+#define swap16be swap16
 #define swap32le ident32
+#define swap32be swap32
 #define swap64le ident64
+#define swap64be swap64
 #define memcpy_swap64le memcpy_swap64
+#endif
+
+#if BYTE_ORDER == BIG_ENDIAN
+#define SWAP16BE IDENT16
+#define SWAP16LE SWAP16
+#define SWAP32BE IDENT32
+#define SWAP32LE SWAP32
+#define SWAP64BE IDENT64
+#define SWAP64LE SWAP64
+#define swap16be ident16
+#define swap16le swap16
+#define swap32be ident32
+#define swap32le swap32
+#define swap64be ident64
+#define swap64le swap64
 #endif
