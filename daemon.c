@@ -215,6 +215,47 @@ uint64_t daemon_mining_hashrate(void) {
     return (uint64_t)speed;
 }
 
+// Full snapshot of the daemon's miner. /mining_status carries speed and
+// blocks_found; active is inferred from the status string because the daemon
+// does not emit a dedicated bool. height comes from get_info, a separate
+// call, and is 0 if that call fails — callers must not treat 0 as "at
+// genesis", only as "unknown".
+bool daemon_mining_status(daemon_mining_status_t *out) {
+    if (out == NULL) return false;
+    memset(out, 0, sizeof(*out));
+
+    char resp[16384];
+    if (rpc_call_ep("/mining_status", "{}", resp, sizeof(resp)) != 0)
+        return false;
+
+    long long speed = json_int(resp, "speed");
+    if (speed > 0) out->hashrate = (uint64_t)speed;
+
+    long long found = json_int(resp, "blocks_found");
+    if (found >= 0) out->blocks_found = (uint64_t)found;
+
+    long long thr = json_int(resp, "threads_count");
+    if (thr > 0) out->threads = (int)thr;
+
+    // The daemon returns "status":"OK" while mining and the string carries
+    // "active":true in newer builds. Accept either as "running".
+    out->active = (strstr(resp, "\"active\":true") != NULL) ||
+                  (strstr(resp, "\"active\": true") != NULL) ||
+                  (strstr(resp, "\"status\":\"OK\"") != NULL) ||
+                  (strstr(resp, "\"status\": \"OK\"") != NULL);
+
+    // Height is on a different endpoint. Best effort: leaving it 0 must not
+    // erase the rest of the snapshot.
+    char body[] = "{\"jsonrpc\":\"2.0\",\"id\":\"0\",\"method\":\"get_info\"}";
+    char info[16384];
+    if (rpc_call(body, info, sizeof(info)) == 0) {
+        long long h = json_int(info, "height");
+        if (h > 0) out->height = (uint64_t)h;
+    }
+
+    return true;
+}
+
 void daemon_stop_mining(void) {
     char resp[4096];
     (void)rpc_call_ep("/stop_mining", "{}", resp, sizeof(resp));
