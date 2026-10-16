@@ -42,7 +42,21 @@ bool     daemon_submit_block(const uint8_t *template_blob, size_t template_len);
 
 // --- Daemon mode (internal hashing) -----------------------------------------
 
+// Snapshot of the daemon's own miner. hashrate is H/s as the daemon reports
+// it. blocks_found is the count since the daemon started mining; height is
+// best-effort from get_info and is 0 if the call failed. active is true when
+// the daemon's response says mining is running — a false active with a stale
+// hashrate means the daemon stopped the miner out from under us.
+typedef struct {
+    uint64_t hashrate;
+    uint64_t blocks_found;
+    uint64_t height;
+    int      threads;
+    bool     active;
+} daemon_mining_status_t;
+
 bool     daemon_start_mining(const char *wallet_address, int threads);
+bool     daemon_mining_status(daemon_mining_status_t *out);
 uint64_t daemon_mining_hashrate(void);
 void     daemon_stop_mining(void);
 
