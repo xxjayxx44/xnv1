@@ -155,14 +155,67 @@ static void *pool_reporter(void *arg) {
 
 // --- Solo mode: daemon-driven mining ---------------------------------------
 
+// Polls the daemon every 5s. Reports three things: hashrate as the daemon
+// sees it, height changes as the chain advances, and block-found deltas —
+// the only "accepted share" solo mode has, since the daemon is the one doing
+// the hashing and only surfaces a block once it has beaten the network
+// target. First snapshot primes the counters so an already-running daemon
+// does not fire a spurious [ACCEPT] on the first tick.
 static void *daemon_rate_reporter(void *arg) {
     (void)arg;
+
+    uint64_t last_blocks = 0;
+    uint64_t last_height = 0;
+    bool     seen_first  = false;
+    struct timespec ts = { .tv_sec = 5 };
+
     while (!atomic_load(&g_stop)) {
-        struct timespec ts = { .tv_sec = 10 };
         nanosleep(&ts, NULL);
         if (atomic_load(&g_stop)) break;
-        uint64_t hps = daemon_mining_hashrate();
-        fprintf(stderr, "[rate] %llu H/s\n", (unsigned long long)hps);
+
+        daemon_mining_status_t st;
+        if (!daemon_mining_status(&st)) {
+            fprintf(stderr, "[rate] status RPC failed\n");
+            continue;
+        }
+
+        // Prime the counters. Do not fire "found" on the baseline — a daemon
+        // that has been mining before we attached reports non-zero on the
+        // first poll.
+        if (!seen_first) {
+            last_blocks = st.blocks_found;
+            last_height = st.height;
+            seen_first  = true;
+        }
+
+        // The only "accepted share" solo has: a block that met the network
+        // target and was submitted by the daemon. Delta, not absolute.
+        if (st.blocks_found > last_blocks) {
+            uint64_t delta = st.blocks_found - last_blocks;
+            fprintf(stderr, "[ACCEPT] %llu block%s found — total=%llu\n",
+                    (unsigned long long)delta,
+                    delta == 1 ? "" : "s",
+                    (unsigned long long)st.blocks_found);
+        }
+        last_blocks = st.blocks_found;
+
+        if (st.height != 0 && st.height != last_height) {
+            fprintf(stderr, "[chain] height %llu -> %llu\n",
+                    (unsigned long long)last_height,
+                    (unsigned long long)st.height);
+            last_height = st.height;
+        }
+
+        if (!st.active && st.hashrate == 0) {
+            fprintf(stderr, "[rate] daemon reports mining stopped\n");
+        } else {
+            fprintf(stderr,
+                    "[rate] %llu H/s  threads=%d  active=%d  blocks=%llu  height=%llu\n",
+                    (unsigned long long)st.hashrate, st.threads,
+                    st.active ? 1 : 0,
+                    (unsigned long long)st.blocks_found,
+                    (unsigned long long)st.height);
+        }
     }
     return NULL;
 }
