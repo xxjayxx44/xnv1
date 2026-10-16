@@ -165,10 +165,9 @@ bool daemon_submit_block(const uint8_t *template_blob, size_t template_len) {
 
 // --- Daemon-mode mining -----------------------------------------------------
 //
-// The daemon owns the chain DB, so it can derive the per-block CNA seed
-// that cn_slow_hash_v11 needs. start_mining hands it the wallet and thread
-// count and lets it mine internally. This is the only way an external
-// process can produce valid Nerva blocks.
+// start_mining hands the daemon a wallet and thread count and lets it mine
+// internally. The daemon owns the chain DB, so it can derive the per-block
+// CNA seed that cn_slow_hash_v11 needs.
 
 bool daemon_start_mining(const char *wallet_address, int threads) {
     if (threads <= 0) {
@@ -189,8 +188,6 @@ bool daemon_start_mining(const char *wallet_address, int threads) {
         return false;
     }
 
-    // The daemon returns {"id":"0","jsonrpc":"2.0","result":{"status":"OK"}}
-    // on success, or an "error" object with a message on failure.
     if (strstr(resp, "\"error\"") &&
         !strstr(resp, "\"error\":null") &&
         !strstr(resp, "\"error\": null")) {
@@ -205,8 +202,6 @@ uint64_t daemon_mining_hashrate(void) {
     char resp[16384];
     if (rpc_call(body, resp, sizeof(resp)) != 0) return 0;
 
-    // mining_status returns result.speed (integer H/s), result.active (bool),
-    // result.threads_count. We want speed.
     long long speed = json_int(resp, "speed");
     if (speed < 0) return 0;
     return (uint64_t)speed;
@@ -215,8 +210,6 @@ uint64_t daemon_mining_hashrate(void) {
 void daemon_stop_mining(void) {
     char body[] = "{\"jsonrpc\":\"2.0\",\"id\":\"0\",\"method\":\"stop_mining\"}";
     char resp[4096];
-    // Best effort — this is called on shutdown paths where the daemon may
-    // already be gone. Failures are silent.
     (void)rpc_call(body, resp, sizeof(resp));
 }
 
