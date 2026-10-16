@@ -78,6 +78,47 @@ static void install_new_job(const struct miner_job *mj) {
             mj->solo ? "(solo)" : mj->job_id);
 }
 
+// Reads /proc/meminfo and prints the hugepage pool the miner's next pad
+// allocation will draw from. Solo mode delegates hashing to the daemon, so
+// this reports the SYSTEM pool, not the daemon's own allocation. The daemon
+// makes the same allocate_hugepage() call pool mode makes, so a pool of
+// zero here means the daemon is hashing on 4 KB pages too — the tier the
+// pad lands on is what actually carries the hashrate.
+#if defined(__linux__)
+static void report_hugepages(void) {
+    FILE *f = fopen("/proc/meminfo", "r");
+    if (!f) return;
+    unsigned long total = 0, free_ = 0, size_kb = 0;
+    char line[128];
+    while (fgets(line, sizeof(line), f)) {
+        unsigned long v;
+        if (sscanf(line, "HugePages_Total: %lu", &v) == 1) { total = v; continue; }
+        if (sscanf(line, "HugePages_Free:  %lu", &v) == 1) { free_ = v; continue; }
+        if (sscanf(line, "Hugepagesize:    %lu kB", &v) == 1) { size_kb = v; continue; }
+    }
+    fclose(f);
+
+    if (total == 0) {
+        fprintf(stderr,
+            "[huge] no hugepages reserved — pad will fall back to THP/malloc; "
+            "run ./hugepages.sh as root to fix\n");
+    } else if (free_ == 0) {
+        fprintf(stderr,
+            "[huge] pool: %lu total / 0 free × %lu kB — exhausted, miner "
+            "will fall through to THP\n",
+            total, size_kb);
+    } else {
+        fprintf(stderr,
+            "[huge] pool: %lu total / %lu free × %lu kB\n",
+            total, free_, size_kb);
+    }
+}
+#else
+static void report_hugepages(void) {
+    fprintf(stderr, "[huge] hugepage report only implemented for Linux\n");
+}
+#endif
+
 // --- Pool mode: external hashing -------------------------------------------
 
 struct worker_arg { int thread_id; int thread_count; };
@@ -179,17 +220,12 @@ static void *daemon_rate_reporter(void *arg) {
             continue;
         }
 
-        // Prime the counters. Do not fire "found" on the baseline — a daemon
-        // that has been mining before we attached reports non-zero on the
-        // first poll.
         if (!seen_first) {
             last_blocks = st.blocks_found;
             last_height = st.height;
             seen_first  = true;
         }
 
-        // The only "accepted share" solo has: a block that met the network
-        // target and was submitted by the daemon. Delta, not absolute.
         if (st.blocks_found > last_blocks) {
             uint64_t delta = st.blocks_found - last_blocks;
             fprintf(stderr, "[ACCEPT] %llu block%s found — total=%llu\n",
@@ -279,6 +315,11 @@ int main(int argc, char **argv) {
     signal(SIGINT, on_sigint);
     signal(SIGTERM, on_sigint);
     signal(SIGPIPE, SIG_IGN);
+
+    // Report once before either mode spins up. The tier the pad lands on is
+    // the same for the miner's threads (pool) and the daemon's threads
+    // (solo), so this is worth seeing even when the daemon does the hashing.
+    report_hugepages();
 
     if (g_solo) {
         fprintf(stderr, "xnv — Nerva miner (solo, daemon-driven)\n");
