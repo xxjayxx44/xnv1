@@ -39,7 +39,12 @@ static void bin2hex(const uint8_t *bin, size_t len, char *out) {
     out[2*len] = 0;
 }
 
-static int rpc_call(const char *body, char *response, size_t resp_sz) {
+// The daemon exposes two RPC shapes:
+//   - JSON-RPC 2.0 at /json_rpc: get_info, get_block_template, submit_block
+//   - Legacy endpoints at their own paths: /start_mining, /mining_status,
+//     /stop_mining. These take a plain JSON body, not a JSON-RPC envelope.
+// rpc_call_ep takes the path so each caller sends its request to the right one.
+static int rpc_call_ep(const char *path, const char *body, char *response, size_t resp_sz) {
     int fd = socket(AF_INET, SOCK_STREAM, 0);
     if (fd < 0) return -1;
 
@@ -56,14 +61,14 @@ static int rpc_call(const char *body, char *response, size_t resp_sz) {
 
     char req[65536];
     int req_len = snprintf(req, sizeof(req),
-        "POST /json_rpc HTTP/1.1\r\n"
+        "POST %s HTTP/1.1\r\n"
         "Host: %s:%d\r\n"
         "Content-Type: application/json\r\n"
         "Content-Length: %zu\r\n"
         "Connection: close\r\n"
         "\r\n"
         "%s",
-        g_host, g_port, strlen(body), body);
+        path, g_host, g_port, strlen(body), body);
     if (req_len <= 0 || (size_t)req_len >= sizeof(req)) { close(fd); return -1; }
     if (send(fd, req, (size_t)req_len, 0) != req_len) { close(fd); return -1; }
 
@@ -82,6 +87,11 @@ static int rpc_call(const char *body, char *response, size_t resp_sz) {
         memmove(response, body_start, strlen(body_start) + 1);
     }
     return 0;
+}
+
+// JSON-RPC 2.0 methods go through /json_rpc.
+static int rpc_call(const char *body, char *response, size_t resp_sz) {
+    return rpc_call_ep("/json_rpc", body, response, resp_sz);
 }
 
 static const char *json_find(const char *buf, const char *key) {
@@ -165,9 +175,10 @@ bool daemon_submit_block(const uint8_t *template_blob, size_t template_len) {
 
 // --- Daemon-mode mining -----------------------------------------------------
 //
-// start_mining hands the daemon a wallet and thread count and lets it mine
-// internally. The daemon owns the chain DB, so it can derive the per-block
-// CNA seed that cn_slow_hash_v11 needs.
+// start_mining / mining_status / stop_mining live at their own HTTP paths,
+// not under /json_rpc. They take a plain JSON body and return a plain JSON
+// response. The daemon owns the chain DB and derives the CNA seed inside
+// its own miner.
 
 bool daemon_start_mining(const char *wallet_address, int threads) {
     if (threads <= 0) {
@@ -177,20 +188,20 @@ bool daemon_start_mining(const char *wallet_address, int threads) {
 
     char body[1024];
     snprintf(body, sizeof(body),
-        "{\"jsonrpc\":\"2.0\",\"id\":\"0\",\"method\":\"start_mining\","
-        "\"params\":{\"miner_address\":\"%s\",\"threads_count\":%d,"
-        "\"do_background_mining\":false,\"ignore_battery\":true}}",
+        "{\"miner_address\":\"%s\",\"threads_count\":%d,"
+        "\"do_background_mining\":false,\"ignore_battery\":true}",
         wallet_address, threads);
 
     char resp[8192];
-    if (rpc_call(body, resp, sizeof(resp)) != 0) {
+    if (rpc_call_ep("/start_mining", body, resp, sizeof(resp)) != 0) {
         fprintf(stderr, "start_mining: RPC transport failed\n");
         return false;
     }
 
-    if (strstr(resp, "\"error\"") &&
-        !strstr(resp, "\"error\":null") &&
-        !strstr(resp, "\"error\": null")) {
+    // Success is {"status":"OK"}. Anything else, including a JSON "error"
+    // object, is a refusal.
+    if (!strstr(resp, "\"status\":\"OK\"") &&
+        !strstr(resp, "\"status\": \"OK\"")) {
         fprintf(stderr, "start_mining rejected: %s\n", resp);
         return false;
     }
@@ -198,9 +209,8 @@ bool daemon_start_mining(const char *wallet_address, int threads) {
 }
 
 uint64_t daemon_mining_hashrate(void) {
-    char body[] = "{\"jsonrpc\":\"2.0\",\"id\":\"0\",\"method\":\"mining_status\"}";
     char resp[16384];
-    if (rpc_call(body, resp, sizeof(resp)) != 0) return 0;
+    if (rpc_call_ep("/mining_status", "{}", resp, sizeof(resp)) != 0) return 0;
 
     long long speed = json_int(resp, "speed");
     if (speed < 0) return 0;
@@ -208,9 +218,8 @@ uint64_t daemon_mining_hashrate(void) {
 }
 
 void daemon_stop_mining(void) {
-    char body[] = "{\"jsonrpc\":\"2.0\",\"id\":\"0\",\"method\":\"stop_mining\"}";
     char resp[4096];
-    (void)rpc_call(body, resp, sizeof(resp));
+    (void)rpc_call_ep("/stop_mining", "{}", resp, sizeof(resp));
 }
 
 // --- Raw RPC ----------------------------------------------------------------
