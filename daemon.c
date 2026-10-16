@@ -39,11 +39,9 @@ static void bin2hex(const uint8_t *bin, size_t len, char *out) {
     out[2*len] = 0;
 }
 
-// The daemon exposes two RPC shapes:
-//   - JSON-RPC 2.0 at /json_rpc: get_info, get_block_template, submit_block
-//   - Legacy endpoints at their own paths: /start_mining, /mining_status,
-//     /stop_mining. These take a plain JSON body, not a JSON-RPC envelope.
-// rpc_call_ep takes the path so each caller sends its request to the right one.
+// rpc_call_ep takes the path so each caller hits the right endpoint.
+// /json_rpc carries JSON-RPC 2.0 methods. /start_mining, /mining_status
+// and /stop_mining are legacy endpoints that take a plain JSON body.
 static int rpc_call_ep(const char *path, const char *body, char *response, size_t resp_sz) {
     int fd = socket(AF_INET, SOCK_STREAM, 0);
     if (fd < 0) return -1;
@@ -89,7 +87,6 @@ static int rpc_call_ep(const char *path, const char *body, char *response, size_
     return 0;
 }
 
-// JSON-RPC 2.0 methods go through /json_rpc.
 static int rpc_call(const char *body, char *response, size_t resp_sz) {
     return rpc_call_ep("/json_rpc", body, response, resp_sz);
 }
@@ -127,6 +124,14 @@ bool daemon_init(const char *host, int port) {
     snprintf(g_host, sizeof(g_host), "%s", host);
     g_port = port;
     return true;
+}
+
+uint64_t daemon_get_height(void) {
+    char body[] = "{\"jsonrpc\":\"2.0\",\"id\":\"0\",\"method\":\"get_info\"}";
+    char resp[16384];
+    if (rpc_call(body, resp, sizeof(resp)) != 0) return 0;
+    long long h = json_int(resp, "height");
+    return (h > 0) ? (uint64_t)h : 0;
 }
 
 bool daemon_get_template(const char *wallet_address, daemon_job *job) {
@@ -174,11 +179,6 @@ bool daemon_submit_block(const uint8_t *template_blob, size_t template_len) {
 }
 
 // --- Daemon-mode mining -----------------------------------------------------
-//
-// start_mining / mining_status / stop_mining live at their own HTTP paths,
-// not under /json_rpc. They take a plain JSON body and return a plain JSON
-// response. The daemon owns the chain DB and derives the CNA seed inside
-// its own miner.
 
 bool daemon_start_mining(const char *wallet_address, int threads) {
     if (threads <= 0) {
@@ -198,8 +198,6 @@ bool daemon_start_mining(const char *wallet_address, int threads) {
         return false;
     }
 
-    // Success is {"status":"OK"}. Anything else, including a JSON "error"
-    // object, is a refusal.
     if (!strstr(resp, "\"status\":\"OK\"") &&
         !strstr(resp, "\"status\": \"OK\"")) {
         fprintf(stderr, "start_mining rejected: %s\n", resp);
