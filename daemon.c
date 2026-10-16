@@ -163,13 +163,64 @@ bool daemon_submit_block(const uint8_t *template_blob, size_t template_len) {
            strstr(resp, "\"status\": \"OK\"") != NULL;
 }
 
-uint64_t daemon_get_height(void) {
-    char body[] = "{\"jsonrpc\":\"2.0\",\"id\":\"0\",\"method\":\"get_info\"}";
+// --- Daemon-mode mining -----------------------------------------------------
+//
+// The daemon owns the chain DB, so it can derive the per-block CNA seed
+// that cn_slow_hash_v11 needs. start_mining hands it the wallet and thread
+// count and lets it mine internally. This is the only way an external
+// process can produce valid Nerva blocks.
+
+bool daemon_start_mining(const char *wallet_address, int threads) {
+    if (threads <= 0) {
+        long n = sysconf(_SC_NPROCESSORS_ONLN);
+        threads = (n > 0) ? (int)n : 1;
+    }
+
+    char body[1024];
+    snprintf(body, sizeof(body),
+        "{\"jsonrpc\":\"2.0\",\"id\":\"0\",\"method\":\"start_mining\","
+        "\"params\":{\"miner_address\":\"%s\",\"threads_count\":%d,"
+        "\"do_background_mining\":false,\"ignore_battery\":true}}",
+        wallet_address, threads);
+
+    char resp[8192];
+    if (rpc_call(body, resp, sizeof(resp)) != 0) {
+        fprintf(stderr, "start_mining: RPC transport failed\n");
+        return false;
+    }
+
+    // The daemon returns {"id":"0","jsonrpc":"2.0","result":{"status":"OK"}}
+    // on success, or an "error" object with a message on failure.
+    if (strstr(resp, "\"error\"") &&
+        !strstr(resp, "\"error\":null") &&
+        !strstr(resp, "\"error\": null")) {
+        fprintf(stderr, "start_mining rejected: %s\n", resp);
+        return false;
+    }
+    return true;
+}
+
+uint64_t daemon_mining_hashrate(void) {
+    char body[] = "{\"jsonrpc\":\"2.0\",\"id\":\"0\",\"method\":\"mining_status\"}";
     char resp[16384];
     if (rpc_call(body, resp, sizeof(resp)) != 0) return 0;
-    long long h = json_int(resp, "height");
-    return (h > 0) ? (uint64_t)h : 0;
+
+    // mining_status returns result.speed (integer H/s), result.active (bool),
+    // result.threads_count. We want speed.
+    long long speed = json_int(resp, "speed");
+    if (speed < 0) return 0;
+    return (uint64_t)speed;
 }
+
+void daemon_stop_mining(void) {
+    char body[] = "{\"jsonrpc\":\"2.0\",\"id\":\"0\",\"method\":\"stop_mining\"}";
+    char resp[4096];
+    // Best effort — this is called on shutdown paths where the daemon may
+    // already be gone. Failures are silent.
+    (void)rpc_call(body, resp, sizeof(resp));
+}
+
+// --- Raw RPC ----------------------------------------------------------------
 
 int daemon_rpc_call(const char *body, char *response, size_t resp_sz) {
     return rpc_call(body, response, resp_sz);
