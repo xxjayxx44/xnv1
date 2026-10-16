@@ -1,10 +1,18 @@
 // language: C, file: main.c, target: Linux x86-64
+// xnv — Nerva miner.
+//
+//   solo mode:  delegates to the daemon's start_mining. The daemon owns the
+//               chain DB, so it can derive the per-block CNA seed that
+//               cn_slow_hash_v11 needs. This is the only way an external
+//               process produces valid Nerva blocks.
+//
+//   pool mode:  keeps the external hash path. Not currently functional for
+//               v11 (the pool would have to send the seed with each job),
+//               but the pipeline is preserved for future work.
 #define _GNU_SOURCE
 #include "cna.h"
 #include "stratum.h"
 #include "daemon.h"
-#include "scratchpad.h"
-#include "nerva_hash.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -21,11 +29,8 @@
 struct miner_job {
     uint8_t  hashing_blob[256];
     size_t   hashing_len;
-    uint8_t  template_blob[512];
-    size_t   template_len;
     uint8_t  target[32];
     uint64_t height;
-    uint64_t difficulty;
     bool     solo;
     char     job_id[80];
 };
@@ -42,7 +47,6 @@ static bool         g_solo   = false;
 static char         g_wallet[256];
 static char         g_daemon_host[128] = "127.0.0.1";
 static int          g_daemon_port      = 17566;
-static uint64_t     g_last_height      = 0;
 
 static void on_sigint(int sig) { (void)sig; atomic_store(&g_stop, true); }
 
@@ -76,18 +80,6 @@ static void job_from_stratum(const stratum_job *sj, struct miner_job *mj) {
     snprintf(mj->job_id, sizeof(mj->job_id), "%s", sj->job_id);
 }
 
-static void job_from_daemon(const daemon_job *dj, struct miner_job *mj) {
-    memset(mj, 0, sizeof(*mj));
-    memcpy(mj->hashing_blob,  dj->hashing_blob,  dj->hashing_len);
-    mj->hashing_len = dj->hashing_len;
-    memcpy(mj->template_blob, dj->template_blob, dj->template_len);
-    mj->template_len = dj->template_len;
-    mj->height       = dj->height;
-    mj->difficulty   = dj->difficulty;
-    mj->solo         = true;
-    difficulty_to_target(dj->difficulty, mj->target);
-}
-
 static void install_new_job(const struct miner_job *mj) {
     pthread_mutex_lock(&g_job_mtx);
     g_job = *mj;
@@ -98,12 +90,22 @@ static void install_new_job(const struct miner_job *mj) {
             mj->solo ? "(solo)" : mj->job_id);
 }
 
+// --- Pool mode: external hashing -------------------------------------------
+//
+// Kept intact for the pool path. On Nerva v11 this cannot produce valid
+// shares because the per-block CNA seed is not available to the miner.
+// The structure is preserved for chains where the hash depends only on the
+// blob, and for when a pool-side seed delivery method exists.
+
 struct worker_arg { int thread_id; int thread_count; };
 
-static void *worker(void *arg) {
+static void *pool_worker(void *arg) {
     struct worker_arg *wa = (struct worker_arg*)arg;
-    cna_ctx *ctx = cna_create(g_job.height);
-    if (!ctx) { fprintf(stderr, "[t%d] ctx alloc failed\n", wa->thread_id); return NULL; }
+    cna_ctx *ctx = cna_create(0);
+    if (!ctx) {
+        fprintf(stderr, "[t%d] ctx alloc failed\n", wa->thread_id);
+        return NULL;
+    }
 
     uint8_t hash[32];
     int seen_epoch = -1;
@@ -127,8 +129,6 @@ static void *worker(void *arg) {
             if (atomic_load(&g_job_epoch) != seen_epoch) break;
 
             memcpy(job.hashing_blob + NONCE_OFFSET, &nonce, 4);
-            if (job.solo) memcpy(job.template_blob + NONCE_OFFSET, &nonce, 4);
-
             cna_hash(ctx, job.hashing_blob, job.hashing_len, hash);
 
             atomic_fetch_add(&g_hashes, 1);
@@ -136,19 +136,14 @@ static void *worker(void *arg) {
             if (meets_target(hash, job.target)) {
                 fprintf(stderr, "[t%d] candidate nonce=%08x\n", wa->thread_id, nonce);
                 pthread_mutex_lock(&g_submit_mtx);
-                if (job.solo) {
-                    bool ok = daemon_submit_block(job.template_blob, job.template_len);
-                    fprintf(stderr, "[block] %s nonce=%08x\n", ok ? "accepted" : "rejected", nonce);
-                } else {
-                    stratum_job sj;
-                    memset(&sj, 0, sizeof(sj));
-                    memcpy(sj.blob, job.hashing_blob, job.hashing_len);
-                    sj.blob_len = job.hashing_len;
-                    snprintf(sj.job_id, sizeof(sj.job_id), "%s", job.job_id);
-                    memcpy(sj.target, job.target, 32);
-                    sj.height = job.height;
-                    stratum_submit(g_pool, &sj, nonce, hash);
-                }
+                stratum_job sj;
+                memset(&sj, 0, sizeof(sj));
+                memcpy(sj.blob, job.hashing_blob, job.hashing_len);
+                sj.blob_len = job.hashing_len;
+                snprintf(sj.job_id, sizeof(sj.job_id), "%s", job.job_id);
+                memcpy(sj.target, job.target, 32);
+                sj.height = job.height;
+                stratum_submit(g_pool, &sj, nonce, hash);
                 pthread_mutex_unlock(&g_submit_mtx);
             }
 
@@ -161,7 +156,7 @@ static void *worker(void *arg) {
     return NULL;
 }
 
-static void *reporter(void *arg) {
+static void *pool_reporter(void *arg) {
     (void)arg;
     unsigned long last = 0;
     while (!atomic_load(&g_stop)) {
@@ -175,22 +170,20 @@ static void *reporter(void *arg) {
     return NULL;
 }
 
-static void *template_poller(void *arg) {
+// --- Solo mode: daemon-driven mining ---------------------------------------
+//
+// The daemon mines with its own threads. Our job is to start it, poll its
+// rate, and stop it on shutdown. No scratchpad, no template loop, no submit
+// path from this process — the daemon handles all three internally.
+
+static void *daemon_rate_reporter(void *arg) {
     (void)arg;
     while (!atomic_load(&g_stop)) {
-        struct timespec ts = { .tv_sec = 5 };
+        struct timespec ts = { .tv_sec = 10 };
         nanosleep(&ts, NULL);
         if (atomic_load(&g_stop)) break;
-        uint64_t h = daemon_get_height();
-        if (h > g_last_height) {
-            daemon_job dj;
-            if (daemon_get_template(g_wallet, &dj)) {
-                struct miner_job mj;
-                job_from_daemon(&dj, &mj);
-                install_new_job(&mj);
-                g_last_height = h;
-            }
-        }
+        uint64_t hps = daemon_mining_hashrate();
+        fprintf(stderr, "[rate] %llu H/s\n", (unsigned long long)hps);
     }
     return NULL;
 }
@@ -200,7 +193,7 @@ static void usage(const char *prog) {
         "usage: %s [solo|pool] -u USER [-p PASS] [-t N] [-v]\n"
         "  solo mode:  -s -d HOST:PORT -u WALLET\n"
         "  pool mode:  -a ALGO -o stratum+tcp://HOST:PORT -u USER -p PASS\n"
-        "  -s        solo mining\n"
+        "  -s        solo mining (daemon mines internally)\n"
         "  -d H:P    daemon RPC (default 127.0.0.1:17566)\n"
         "  -a ALGO   algorithm name\n"
         "  -o URL    pool url\n"
@@ -255,86 +248,100 @@ int main(int argc, char **argv) {
     signal(SIGTERM, on_sigint);
     signal(SIGPIPE, SIG_IGN);
 
-    fprintf(stderr, "xnv — Nerva v11 miner (%s)\n", g_solo ? "solo" : "pool");
-    fprintf(stderr, "user=%s  threads=%d\n", user, threads);
-
-    pthread_t poller_tid = 0;
-    bool      poller_started = false;
-
     if (g_solo) {
-        fprintf(stderr, "daemon=%s:%d\n", g_daemon_host, g_daemon_port);
-        if (!daemon_init(g_daemon_host, g_daemon_port)) return 1;
+        // --- Solo: hand off to the daemon -----------------------------------
+        fprintf(stderr, "xnv — Nerva miner (solo, daemon-driven)\n");
+        fprintf(stderr, "user=%s  threads=%d  daemon=%s:%d\n",
+                user, threads, g_daemon_host, g_daemon_port);
+
+        if (!daemon_init(g_daemon_host, g_daemon_port)) {
+            fprintf(stderr, "daemon init failed\n");
+            return 1;
+        }
+
         uint64_t h = daemon_get_height();
-        if (h == 0) { fprintf(stderr, "daemon unreachable\n"); return 1; }
+        if (h == 0) {
+            fprintf(stderr, "daemon unreachable at %s:%d\n",
+                    g_daemon_host, g_daemon_port);
+            return 1;
+        }
         fprintf(stderr, "daemon height=%llu\n", (unsigned long long)h);
-        g_last_height = h;
 
-        daemon_job dj;
-        if (!daemon_get_template(g_wallet, &dj)) {
-            fprintf(stderr, "failed to fetch block template\n"); return 1;
+        if (!daemon_start_mining(g_wallet, threads)) {
+            fprintf(stderr, "daemon refused start_mining\n");
+            return 1;
         }
-        struct miner_job mj;
-        job_from_daemon(&dj, &mj);
-        install_new_job(&mj);
-        fprintf(stderr, "template hashing_len=%zu template_len=%zu diff=%llu\n",
-                dj.hashing_len, dj.template_len, (unsigned long long)dj.difficulty);
-    } else {
-        g_pool = stratum_connect(url, user, pass);
-        if (!g_pool) { fprintf(stderr, "failed to connect to pool\n"); return 1; }
-        stratum_job sj;
-        if (!stratum_wait_job(g_pool, &sj)) {
-            fprintf(stderr, "no initial job\n");
-            stratum_disconnect(g_pool); return 1;
-        }
-        struct miner_job mj;
-        job_from_stratum(&sj, &mj);
-        install_new_job(&mj);
-    }
+        fprintf(stderr, "mining started on the daemon\n");
 
-    pthread_t *tids = calloc((size_t)threads, sizeof(pthread_t));
-    struct worker_arg *wa = calloc((size_t)threads, sizeof(*wa));
-    if (!tids || !wa) return 1;
+        pthread_t rep;
+        pthread_create(&rep, NULL, daemon_rate_reporter, NULL);
 
-    for (int i = 0; i < threads; i++) {
-        wa[i].thread_id    = i;
-        wa[i].thread_count = threads;
-        pthread_create(&tids[i], NULL, worker, &wa[i]);
-    }
-
-    pthread_t rep;
-    pthread_create(&rep, NULL, reporter, NULL);
-
-    if (g_solo) {
-        pthread_create(&poller_tid, NULL, template_poller, NULL);
-        poller_started = true;
-    }
-
-    if (g_solo) {
         while (!atomic_load(&g_stop)) {
             struct timespec ts = { .tv_sec = 1 };
             nanosleep(&ts, NULL);
         }
-    } else {
-        while (!atomic_load(&g_stop)) {
-            stratum_job sj;
-            if (!stratum_wait_job(g_pool, &sj)) {
-                atomic_store(&g_stop, true); break;
-            }
-            struct miner_job mj;
-            job_from_stratum(&sj, &mj);
-            install_new_job(&mj);
+
+        fprintf(stderr, "stopping daemon mining...\n");
+        daemon_stop_mining();
+        pthread_join(rep, NULL);
+        daemon_cleanup();
+        fprintf(stderr, "stopped.\n");
+        return 0;
+    }
+
+    // --- Pool mode: external hashing ----------------------------------------
+    fprintf(stderr, "xnv — Nerva miner (pool)\n");
+    fprintf(stderr, "user=%s  threads=%d  pool=%s\n", user, threads, url);
+
+    g_pool = stratum_connect(url, user, pass);
+    if (!g_pool) {
+        fprintf(stderr, "failed to connect to pool\n");
+        return 1;
+    }
+
+    stratum_job sj;
+    if (!stratum_wait_job(g_pool, &sj)) {
+        fprintf(stderr, "no initial job from pool\n");
+        stratum_disconnect(g_pool);
+        return 1;
+    }
+    struct miner_job mj;
+    job_from_stratum(&sj, &mj);
+    install_new_job(&mj);
+
+    pthread_t *tids = calloc((size_t)threads, sizeof(pthread_t));
+    struct worker_arg *wa = calloc((size_t)threads, sizeof(*wa));
+    if (!tids || !wa) {
+        stratum_disconnect(g_pool);
+        free(tids); free(wa);
+        return 1;
+    }
+
+    for (int i = 0; i < threads; i++) {
+        wa[i].thread_id    = i;
+        wa[i].thread_count = threads;
+        pthread_create(&tids[i], NULL, pool_worker, &wa[i]);
+    }
+
+    pthread_t rep;
+    pthread_create(&rep, NULL, pool_reporter, NULL);
+
+    while (!atomic_load(&g_stop)) {
+        if (!stratum_wait_job(g_pool, &sj)) {
+            fprintf(stderr, "[stratum] connection lost\n");
+            atomic_store(&g_stop, true);
+            break;
         }
+        job_from_stratum(&sj, &mj);
+        install_new_job(&mj);
     }
 
     for (int i = 0; i < threads; i++) pthread_join(tids[i], NULL);
     pthread_join(rep, NULL);
-    if (poller_started) pthread_join(poller_tid, NULL);
 
-    if (g_pool) stratum_disconnect(g_pool);
-    daemon_cleanup();
+    stratum_disconnect(g_pool);
     free(tids);
     free(wa);
-
     fprintf(stderr, "stopped. total hashes=%lu\n", atomic_load(&g_hashes));
     return 0;
 }
