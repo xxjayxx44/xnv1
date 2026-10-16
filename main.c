@@ -6,9 +6,9 @@
 //               cn_slow_hash_v11 needs. This is the only way an external
 //               process produces valid Nerva blocks.
 //
-//   pool mode:  keeps the external hash path. Not currently functional for
-//               v11 (the pool would have to send the seed with each job),
-//               but the pipeline is preserved for future work.
+//   pool mode:  external hash path. Not currently functional for v11 (a
+//               pool would have to deliver the seed with each job), but the
+//               pipeline is preserved for future work.
 #define _GNU_SOURCE
 #include "cna.h"
 #include "stratum.h"
@@ -50,18 +50,6 @@ static int          g_daemon_port      = 17566;
 
 static void on_sigint(int sig) { (void)sig; atomic_store(&g_stop, true); }
 
-static void difficulty_to_target(uint64_t diff, uint8_t target[32]) {
-    if (diff == 0) { memset(target, 0, 32); return; }
-    uint64_t limbs[4] = {~0ULL, ~0ULL, ~0ULL, ~0ULL};
-    uint64_t rem = 0;
-    for (int i = 3; i >= 0; i--) {
-        __uint128_t cur = ((__uint128_t)rem << 64) | limbs[i];
-        limbs[i] = (uint64_t)(cur / diff);
-        rem      = (uint64_t)(cur % diff);
-    }
-    memcpy(target, limbs, 32);
-}
-
 static bool meets_target(const uint8_t hash[32], const uint8_t target[32]) {
     for (int i = 31; i >= 0; i--) {
         if (hash[i] < target[i]) return true;
@@ -91,11 +79,6 @@ static void install_new_job(const struct miner_job *mj) {
 }
 
 // --- Pool mode: external hashing -------------------------------------------
-//
-// Kept intact for the pool path. On Nerva v11 this cannot produce valid
-// shares because the per-block CNA seed is not available to the miner.
-// The structure is preserved for chains where the hash depends only on the
-// blob, and for when a pool-side seed delivery method exists.
 
 struct worker_arg { int thread_id; int thread_count; };
 
@@ -171,10 +154,6 @@ static void *pool_reporter(void *arg) {
 }
 
 // --- Solo mode: daemon-driven mining ---------------------------------------
-//
-// The daemon mines with its own threads. Our job is to start it, poll its
-// rate, and stop it on shutdown. No scratchpad, no template loop, no submit
-// path from this process — the daemon handles all three internally.
 
 static void *daemon_rate_reporter(void *arg) {
     (void)arg;
@@ -249,7 +228,6 @@ int main(int argc, char **argv) {
     signal(SIGPIPE, SIG_IGN);
 
     if (g_solo) {
-        // --- Solo: hand off to the daemon -----------------------------------
         fprintf(stderr, "xnv — Nerva miner (solo, daemon-driven)\n");
         fprintf(stderr, "user=%s  threads=%d  daemon=%s:%d\n",
                 user, threads, g_daemon_host, g_daemon_port);
@@ -289,7 +267,6 @@ int main(int argc, char **argv) {
         return 0;
     }
 
-    // --- Pool mode: external hashing ----------------------------------------
     fprintf(stderr, "xnv — Nerva miner (pool)\n");
     fprintf(stderr, "user=%s  threads=%d  pool=%s\n", user, threads, url);
 
